@@ -1,104 +1,114 @@
-name: Docker Release (Tron)
+name: Release
+
 on:
   push:
     tags:
-      - "v*"
+      - "v*.*.*"
 
 jobs:
-  # ── Step 1: Cross-compile both arches natively via zigbuild ──────────────
-  build-binaries:
-    runs-on: ubuntu-latest
+  build-natives:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
-            arch: amd64
-          - target: aarch64-unknown-linux-musl
-            arch: arm64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@master
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - uses: arduino/setup-protoc@v3
-
-      - name: Install zig
-        run: |
-          wget -q https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
-          tar xf zig-linux-x86_64-0.13.0.tar.xz
-          sudo mv zig-linux-x86_64-0.13.0 /usr/local/zig
-          echo "/usr/local/zig" >> $GITHUB_PATH
-
-      - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
-
       - name: Build
-        run: cargo zigbuild --release --target ${{ matrix.target }} --package tron
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p dist/${{ matrix.target }}
+          cp target/${{ matrix.target }}/release/libuserencrypt.* dist/${{ matrix.target }}/ || \
+          cp target/${{ matrix.target }}/release/userencrypt.dll dist/${{ matrix.target }}/ 2>/dev/null || true
 
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: tron-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/tron
+          name: native-${{ matrix.target }}
+          path: dist/${{ matrix.target }}/*
 
-  # ── Step 2: Build multi-arch Docker image using pre-built binaries ────────
-  docker:
-    needs: build-binaries
+  build-core:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v4
 
-      # Download both binaries into dist/amd64/ and dist/arm64/
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Generate UniFFI bindings
+        run: |
+          cargo run --bin uniffi-bindgen generate \
+            src/userencrypt.udl \
+            --language kotlin \
+            --out-dir core/src/main/kotlin/uniffi/
+
+      - name: Build core library
+        working-directory: core
+        run: ./gradlew publishToMavenLocal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-library
+          path: core/build/libs/*.jar
+
+  build-paper:
+    needs: [build-core]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: "temurin"
+
+      - name: Download core
+        uses: actions/download-artifact@v4
+        with:
+          name: core-library
+          path: ~/.m2/repository
+
+      - name: Build Paper plugin
+        working-directory: paper
+        run: ./gradlew shadowJar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paper-plugin
+          path: paper/build/libs/*-all.jar
+
+  # Create release with all artifacts
+  release:
+    needs: [build-natives, build-paper]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
       - uses: actions/download-artifact@v4
+
+      - name: Organize release files
+        run: |
+          mkdir -p release
+          mv paper-plugin/*.jar release/
+          for dir in native-*; do
+            target=$(echo $dir | sed 's/native-//')
+            mkdir -p "release/$target"
+            mv "$dir"/* "release/$target/"
+          done
+
+      - uses: softprops/action-gh-release@v1
         with:
-          name: tron-amd64
-          path: dist/amd64
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: tron-arm64
-          path: dist/arm64
-
-      - run: chmod +x dist/amd64/tron dist/arm64/tron
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest
-
-      - name: Build and push multi-arch image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile.prebuilt
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          files: release/**/*
