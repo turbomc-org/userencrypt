@@ -12,99 +12,56 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Build native libraries for all platforms
-  build-natives:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            use-cross: true
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            use-cross: true
-          # macOS
-          - target: x86_64-apple-darwin
-            os: macos-13
-            use-cross: false
-          - target: aarch64-apple-darwin
-            os: macos-14
-            use-cross: false
-          # Windows
-          - target: x86_64-pc-windows-gnu
-            os: ubuntu-latest
-            use-cross: true
-
+  # Build both Linux targets in one fast job using cargo-zigbuild
+  build-linux:
+    name: Build Linux Natives
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-musl
 
-      - name: Install cross
-        if: matrix.use-cross
+      - name: Install cargo-zigbuild
         uses: taiki-e/install-action@v2
         with:
-          tool: cross
+          tool: cargo-zigbuild
 
-      - name: Build release binary
+      - name: Build x86_64 GNU (glibc 2.17 compatible)
         run: |
-          if [ "${{ matrix.use-cross }}" == "true" ]; then
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+          cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17
+          mkdir -p dist/x86_64-unknown-linux-gnu
+          cp target/x86_64-unknown-linux-gnu/release/libuserencrypt.so dist/x86_64-unknown-linux-gnu/
+          strip dist/x86_64-unknown-linux-gnu/libuserencrypt.so
 
-      - name: Strip and package
-        shell: bash
+      - name: Build ARM64 musl (static)
         run: |
-          mkdir -p dist/${{ matrix.target }}
+          cargo zigbuild --release --target aarch64-unknown-linux-musl
+          mkdir -p dist/aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/libuserencrypt.so dist/aarch64-unknown-linux-musl/
+          strip dist/aarch64-unknown-linux-musl/libuserencrypt.so
 
-          # Determine library name based on platform
-          case ${{ matrix.target }} in
-            *windows*)
-              LIB_NAME="userencrypt.dll"
-              SRC="target/${{ matrix.target }}/release/userencrypt.dll"
-              ;;
-            *apple*)
-              LIB_NAME="libuserencrypt.dylib"
-              SRC="target/${{ matrix.target }}/release/libuserencrypt.dylib"
-              ;;
-            *)
-              LIB_NAME="libuserencrypt.so"
-              SRC="target/${{ matrix.target }}/release/libuserencrypt.so"
-              ;;
-          esac
+      - name: Generate checksums
+        run: |
+          for dir in dist/*/; do
+            cd "$dir"
+            sha256sum * > checksums.sha256
+            cd ../..
+          done
 
-          # Strip if possible (not Windows cross-compile)
-          if [[ ! "${{ matrix.target }}" == *windows* ]]; then
-            strip "$SRC" || true
-          fi
-
-          cp "$SRC" "dist/${{ matrix.target }}/$LIB_NAME"
-
-          # Create checksum
-          cd dist/${{ matrix.target }}
-          sha256sum "$LIB_NAME" > "$LIB_NAME.sha256"
-          cd ../..
-
-      - name: Upload native artifact
+      - name: Upload natives
         uses: actions/upload-artifact@v4
         with:
-          name: native-${{ matrix.target }}
-          path: dist/${{ matrix.target }}/*
+          name: linux-natives
+          path: dist/**/*
 
-  # Build thin Paper plugin JAR
+  # Build Paper plugin (no natives bundled - lazy download)
   build-plugin:
     name: Build Paper Plugin
     runs-on: ubuntu-latest
-    needs: build-natives
+    needs: build-linux
     steps:
       - uses: actions/checkout@v4
 
@@ -117,61 +74,32 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Download all native artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: paper/src/main/resources/natives
-          pattern: native-*
-          merge-multiple: true
-
-      - name: Generate version info
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "version=$VERSION" >> $GITHUB_ENV
-          echo "release_url=https://github.com/${{ github.repository }}/releases/download/v$VERSION" >> $GITHUB_ENV
-
-      - name: Build plugin with Gradle
+      - name: Build plugin (triggers build.rs)
         working-directory: paper
         run: |
-          ./gradlew build \
-            -PpluginVersion=$version \
-            -PnativeBaseUrl=$release_url \
-            --no-daemon
+          # Build.rs will generate UniFFI bindings and core Kotlin files
+          ../gradlew shadowJar -Pversion=${GITHUB_REF#refs/tags/v}
 
-      - name: Upload plugin artifact
+      - name: Upload plugin
         uses: actions/upload-artifact@v4
         with:
           name: paper-plugin
-          path: paper/build/libs/*.jar
+          path: paper/build/libs/*-all.jar
 
-  # Create GitHub Release with all assets
+  # Create release with all assets
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build-natives, build-plugin]
+    needs: [build-linux, build-plugin]
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: "native-*|paper-plugin"
-          merge-multiple: false
 
-      - name: Organize release files
+      - name: Organize release
         run: |
           mkdir -p release
-
-          # Move plugin JAR
-          mv artifacts/paper-plugin/*.jar release/
-
-          # Move native libs to platform folders
-          for dir in artifacts/native-*; do
-            target=$(basename "$dir" | sed 's/native-//')
-            mkdir -p "release/$target"
-            mv "$dir"/* "release/$target/" 2>/dev/null || true
-          done
-
-          ls -la release/
+          mv paper-plugin/*.jar release/
+          mv linux-natives/* release/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
