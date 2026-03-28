@@ -1,8 +1,9 @@
 plugins {
     kotlin("jvm") version "2.3.0"
+    `maven-publish`
 }
 
-group = "org.turbomc.userencrypt"
+group = "org.turbomc"
 version = "1.0-SNAPSHOT"
 
 repositories {
@@ -21,4 +22,15 @@ kotlin {
 
 tasks.test {
     useJUnitPlatform()
+}
+
+publishing {
+    publications {
+        create<MavenPublication>("maven") {
+            from(components["kotlin"])
+            groupId = project.group.toString()
+            artifactId = "core"
+            version = project.version.toString()
+        }
+    }
 }
