@@ -12,8 +12,6 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -24,23 +22,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          rustup target add aarch64-unknown-linux-gnu
-
-      - name: Configure cargo for cross-compilation
-        run: |
-          mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << 'EOF'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          EOF
-
       - name: Build
-        env:
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
         run: |
           cargo build --release --target ${{ matrix.target }}
           mkdir -p dist/${{ matrix.target }}
@@ -52,63 +34,9 @@ jobs:
           name: native-${{ matrix.target }}
           path: dist/${{ matrix.target }}/*
 
-  build-core:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: "21"
-          distribution: "temurin"
-
-      - name: Generate UniFFI bindings
-        run: |
-          cargo run --bin uniffi-bindgen generate \
-            src/userencrypt.udl \
-            --language kotlin \
-            --out-dir core/src/main/kotlin/uniffi/
-
-      - name: Build core library
-        working-directory: core
-        run: ./gradlew publishToMavenLocal
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: core-library
-          path: core/build/libs/*.jar
-
-  build-paper:
-    needs: [build-core]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup JDK
-        uses: actions/setup-java@v4
-        with:
-          java-version: "21"
-          distribution: "temurin"
-
-      - name: Download core
-        uses: actions/download-artifact@v4
-        with:
-          name: core-library
-          path: ~/.m2/repository
-
-      - name: Build Paper plugin
-        working-directory: paper
-        run: ./gradlew shadowJar
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: paper-plugin
-          path: paper/build/libs/*-all.jar
-
   # Create release with all artifacts
   release:
-    needs: [build-natives, build-paper]
+    needs: [build-natives]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -118,7 +46,6 @@ jobs:
       - name: Organize release files
         run: |
           mkdir -p release
-          mv paper-plugin/*.jar release/
           for dir in native-*; do
             target=$(echo $dir | sed 's/native-//')
             mkdir -p "release/$target"
