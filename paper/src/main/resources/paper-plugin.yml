@@ -1,0 +1,7 @@
+name: userencrypt
+version: '1.0-SNAPSHOT'
+main: org.turbomc.userencrypt.Userencrypt
+api-version: '1.21'
+authors: [ Harihar Nautiyal ]
+description: Authentication plugin by TurboMC
+website: turbomc.org

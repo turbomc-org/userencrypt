@@ -1,0 +1,10 @@
+/target
+kotlin-bindings
+paper/.gradle
+paper/.idea
+paper/.kotlin
+paper/build
+core/.gradle
+core/.idea
+core/.kotlin
+core/build
